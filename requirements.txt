@@ -1,0 +1,6 @@
+google-genai>=1.0.0
+requests>=2.31.0
+yfinance>=0.2.40
+python-dotenv>=1.0.0
+rich>=13.7.0
+finvizfinance>=0.10

@@ -1,0 +1,86 @@
+name: Sovereign DD
+
+on:
+  schedule:
+    # 6:00 AM ET (UTC-4 DST / UTC-5 EST). Uses 10:00 UTC — correct during DST (Apr-Nov).
+    # During EST (Nov-Mar) this fires at 5:00 AM ET — still well before market open.
+    - cron: "0 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      ticker:
+        description: "Single ticker to analyze (leave empty for full portfolio)"
+        required: false
+        default: ""
+        type: string
+
+jobs:
+  analyze:
+    name: Run analysis
+    runs-on: ubuntu-latest
+    # Portfolio scan is ~15 hold-mode debates (well under an hour); 90 min stops
+    # a hung LLM call from occupying the runner for GitHub's full 6-hour limit.
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run analysis
+        env:
+          GEMINI_API_KEYS:          ${{ secrets.GEMINI_API_KEYS }}
+          FINNHUB_API_KEY:          ${{ secrets.FINNHUB_API_KEY }}
+          FMP_API_KEY:              ${{ secrets.FMP_API_KEY }}
+          FRED_API_KEY:             ${{ secrets.FRED_API_KEY }}
+          ALPHA_VANTAGE_API_KEYS:   ${{ secrets.ALPHA_VANTAGE_API_KEYS }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC_TRADE_ALERTS: ${{ secrets.TELEGRAM_TOPIC_TRADE_ALERTS }}
+          TELEGRAM_TOPIC_DEEP_DIVES:   ${{ secrets.TELEGRAM_TOPIC_DEEP_DIVES }}
+          TELEGRAM_TOPIC_SCAN_RESULTS: ${{ secrets.TELEGRAM_TOPIC_SCAN_RESULTS }}
+          TELEGRAM_TOPIC_WATCHLIST:    ${{ secrets.TELEGRAM_TOPIC_WATCHLIST }}
+          PORTFOLIO_TICKERS: "AMZN,ANET,EME,MRVL,PENG,AVGO,GOOG,MU,NOW,VST,DAVE,HPQ.V,NU,CEG,ETN"
+          DD_UPLOAD_SECRET:   ${{ secrets.DD_UPLOAD_SECRET }}
+          SOVEREIGN_EYE_URL:  https://sovereign-eye.pages.dev
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+        run: |
+          TICKER="${{ github.event.inputs.ticker }}"
+          if [ -z "$TICKER" ]; then
+            echo "=== Portfolio scan (unattended — live events off) ==="
+            python main.py --portfolio --save --notify
+          else
+            # Single-ticker runs are user-triggered from the dashboard and watched
+            # live, so stream debate events to KV. Scheduled runs leave LIVE_EVENTS
+            # unset to stay under the Cloudflare KV free-tier write budget.
+            echo "=== Single ticker: $TICKER (live events on) ==="
+            LIVE_EVENTS=1 python main.py "$TICKER" --save
+          fi
+
+      - name: Upload results to Sovereign Eye
+        env:
+          DD_UPLOAD_SECRET:   ${{ secrets.DD_UPLOAD_SECRET }}
+          SOVEREIGN_EYE_URL:  https://sovereign-eye.pages.dev
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+        run: python upload_kv.py
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC:     ${{ secrets.TELEGRAM_TOPIC_DEEP_DIVES }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d message_thread_id="${TELEGRAM_TOPIC}" \
+            -d text="Sovereign DD analyze run FAILED (run ${GITHUB_RUN_ID}). Check GitHub Actions." || true

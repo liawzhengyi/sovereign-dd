@@ -1,0 +1,111 @@
+name: Sovereign Scout (continuous)
+
+on:
+  schedule:
+    # Every 4 hours. With 48h dedup there is no value running more frequently —
+    # the candidate pool doesn't change meaningfully in under 4 hours.
+    # 6 runs/day × 30 debates × ~25 calls = ~4,500 RPD (33% of 13,500 budget).
+    - cron: "0 */4 * * *"
+  workflow_dispatch: {}
+
+concurrency:
+  group: scout
+  cancel-in-progress: false  # queue, don't cancel — don't waste in-progress debates
+
+jobs:
+  scout:
+    name: Run scout + gems
+    runs-on: ubuntu-latest
+    # A hung LLM call once ran the full 6h GitHub limit, and the queued next run
+    # was auto-cancelled. Normal runs are 30-60 min; 150 converts a zombie into a
+    # clean failure (Telegram alert fires) while the queued run still executes.
+    timeout-minutes: 150
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore scout history
+        id: restore-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            output/scout_history.json
+            output/scout_notified.json
+            output/gems_history.json
+            output/scout_seen.json
+          # Restore the most recent history cache from any previous run
+          key: scout-history-${{ github.run_id }}
+          restore-keys: scout-history-
+
+      - name: Restore scout history from KV (cache-miss fallback)
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        env:
+          SOVEREIGN_EYE_URL: https://sovereign-eye.pages.dev
+          DD_UPLOAD_SECRET:  ${{ secrets.DD_UPLOAD_SECRET }}
+        run: python download_history.py
+
+      - name: Run scout + gems
+        env:
+          GEMINI_API_KEYS:          ${{ secrets.GEMINI_API_KEYS }}
+          FINNHUB_API_KEY:          ${{ secrets.FINNHUB_API_KEY }}
+          FMP_API_KEY:              ${{ secrets.FMP_API_KEY }}
+          FRED_API_KEY:             ${{ secrets.FRED_API_KEY }}
+          ALPHA_VANTAGE_API_KEYS:   ${{ secrets.ALPHA_VANTAGE_API_KEYS }}
+          TELEGRAM_BOT_TOKEN:       ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:         ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC_TRADE_ALERTS: ${{ secrets.TELEGRAM_TOPIC_TRADE_ALERTS }}
+          TELEGRAM_TOPIC_DEEP_DIVES:   ${{ secrets.TELEGRAM_TOPIC_DEEP_DIVES }}
+          TELEGRAM_TOPIC_SCAN_RESULTS: ${{ secrets.TELEGRAM_TOPIC_SCAN_RESULTS }}
+          TELEGRAM_TOPIC_WATCHLIST:    ${{ secrets.TELEGRAM_TOPIC_WATCHLIST }}
+          PORTFOLIO_TICKERS: "AMZN,ANET,EME,MRVL,PENG,AVGO,GOOG,MU,NOW,VST,DAVE,HPQ.V,NU,CEG,ETN"
+          DD_UPLOAD_SECRET:   ${{ secrets.DD_UPLOAD_SECRET }}
+          SOVEREIGN_EYE_URL:  https://sovereign-eye.pages.dev
+          SUPABASE_URL:       ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:       ${{ secrets.SUPABASE_KEY }}
+          SCOUT_DEBATE_COUNT: "24"
+          SCOUT_COOLDOWN_HOURS: "48"
+          GEMS_DEBATE_COUNT: "6"
+          GEMS_COOLDOWN_HOURS: "72"
+        run: python main.py --scout --gems --save --notify
+
+      - name: Save scout history
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            output/scout_history.json
+            output/scout_notified.json
+            output/gems_history.json
+            output/scout_seen.json
+          key: scout-history-${{ github.run_id }}
+
+      - name: Upload results to Sovereign Eye
+        if: always()
+        env:
+          DD_UPLOAD_SECRET:  ${{ secrets.DD_UPLOAD_SECRET }}
+          SOVEREIGN_EYE_URL: https://sovereign-eye.pages.dev
+          SUPABASE_URL:      ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:      ${{ secrets.SUPABASE_KEY }}
+        run: python upload_kv.py
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_TOPIC:     ${{ secrets.TELEGRAM_TOPIC_SCAN_RESULTS }}
+        run: |
+          curl -s -X POST "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+            -d chat_id="${TELEGRAM_CHAT_ID}" \
+            -d message_thread_id="${TELEGRAM_TOPIC}" \
+            -d text="Sovereign scout+gems run FAILED (run ${GITHUB_RUN_ID}). Check GitHub Actions." || true
